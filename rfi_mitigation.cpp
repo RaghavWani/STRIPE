@@ -38,46 +38,46 @@ std::vector<uint8_t> read_binary_data(const std::string& filename, const size_t 
 
 // Datatype conversion function1 
 void uint8_to_float(const std::vector<uint8_t>& in, std::vector<float>& out, size_t nsamples, size_t nchans, float zero_off = 64.0f) {
-    out.resize(nsamples*nchans);
+    size_t N = nsamples * nchans;
+    out.resize(N);
 
-    for (size_t i = 0; i < nsamples; ++i) {
-        for (size_t j = 0; j < nchans; ++j) {
-            out[i*nchans + j] = static_cast<float>(in[i*nchans + j]) - zero_off;
-        }
-    }
+    #pragma omp parallel for simd
+    for (size_t k = 0; k < N; ++k) 
+        out[k] = static_cast<float>(in[k]) - zero_off;
+        
 }
 
 // Datatype conversion function2
 void float_to_uint8(std::vector<float>& in, std::vector<uint8_t>& out, size_t nsamples, size_t nchans, float outmean, float outstd) {
-    double tmpmean=0., tmpstd=0.;
+    size_t N = nsamples * nchans;
 
-	for (long int i=0; i<nsamples; ++i)
-	{
-		for (long int j=0; j<nchans; ++j)
-		{
-			tmpmean += in[i*nchans + j];
-			tmpstd += in[i*nchans + j]*in[i*nchans + j];
-		}
-	}
-    auto tmp_1 = nsamples*nchans;
+    double tmpmean = 0.;
+    double tmpstd = 0.;
+
+    #pragma omp parallel for reduction(+:tmpmean,tmpstd)
+    for (size_t k = 0; k < N; ++k) {
+        double v = in[k];
+        tmpmean += v;
+        tmpstd  += v*v;
+    }
+
+    auto tmp_1 = nsamples * nchans;
     tmpmean /= tmp_1;
-	tmpstd /= tmp_1;
-	tmpstd -= tmpmean*tmpmean;
-	tmpstd = std::sqrt(tmpstd);
+    tmpstd /= tmp_1;
+    tmpstd -= tmpmean * tmpmean;
+    tmpstd = std::sqrt(tmpstd);
 
-	float scl = outstd/tmpstd;
+    float scl = outstd/tmpstd;
 	float offs = outmean-scl*tmpmean;
 
-    for (long int i=0; i<nsamples; ++i)
-		{
-			for (long int j=0; j<nchans; ++j)
-			{
-				float tmp = std::round(scl*in[i*nchans + j]+offs);
-				tmp = std::max(0.f, tmp);
-				tmp = std::min(255.f, tmp);
-				out[i*nchans + j] = tmp;
-			}
-		}
+    #pragma omp parallel for simd
+    for (size_t k = 0; k < N; ++k) {
+        float tmp = scl * in[k] + offs;
+        tmp = std::round(tmp);
+        tmp = std::clamp(tmp, 0.0f, 255.0f);
+        out[k] = static_cast<uint8_t>(tmp);
+
+    }
 }
 
 // Raw binary data file writer
@@ -109,19 +109,28 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
     std::vector<double> chmean1(nchans, 0.), chmean2(nchans, 0.), chmean3(nchans, 0.), 
     chmean4(nchans, 0.), chcorr(nchans, 0.), last_data(nchans, 0.);
     
-    for (int i = 1; i < nsamples; ++i) {
-        for (int j = 0; j < nchans; ++j) {
-            double tmp1 = data[i*nchans + j];
-            double tmp2 = tmp1 * tmp1;
-            double tmp3 = tmp2 * tmp1;
-            double tmp4 = tmp2 * tmp2;
-            chmean1[j] += tmp1;
-            chmean2[j] += tmp2;
-            chmean3[j] += tmp3;
-            chmean4[j] += tmp4;
-            chcorr[j] += tmp1 * last_data[j];
-            last_data[j] = tmp1;
+    #pragma omp parallel for
+    for (int j = 0; j < nchans; ++j) {
+        double m1=0,m2=0,m3=0,m4=0,corr=0;
+        double last = data[j];
+    
+        for (int i=1; i<nsamples; ++i) {
+            double tmp = data[i*nchans + j];
+            double tmp2 = tmp*tmp;
+
+            m1 += tmp;
+            m2 += tmp2;
+            m3 += tmp2*tmp;
+            m4 += tmp2*tmp2;
+            corr += tmp * last;
+            last = tmp;
         }
+
+        chmean1[j] = m1;
+        chmean2[j] = m2;
+        chmean3[j] = m3;
+        chmean4[j] = m4;
+        chcorr[j]  = corr;
     }
     auto step1_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
@@ -271,11 +280,12 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
 
     // Step5: Normalization
     auto step5_start = std::chrono::high_resolution_clock::now();
-
-    for (long int i = 0; i < nsamples; ++i)
-    {
-        for (long int j=0; j < nchans; ++j) {
-                data[i*nchans + j] = weights[j]*(data[i*nchans + j] - chmean[j]) / chstd[j];
+    #pragma omp parallel for
+    for (int i = 0; i < nsamples; ++i) {
+        float* row = &data[i*nchans];
+        #pragma omp simd
+        for (int j = 0; j < nchans; ++j) {
+            row[j] = weights[j] * (row[j] - chmean[j]) / chstd[j];
         }
     }
     auto step5_end = std::chrono::high_resolution_clock::now();
@@ -681,8 +691,6 @@ int main(int argc, char* argv[]) {
         size_t block_len = block_size * nchans;
         size_t n_full = raw_data.size() / block_len;
         size_t remainder = raw_data.size() % block_size;
-        std::cout << n_full << std::endl;
-        std::cout << block_len << std::endl;
 
         // process data block by block
         for (int blk=0; blk< n_full; ++blk) {
@@ -693,7 +701,6 @@ int main(int argc, char* argv[]) {
             // size_t block_offset = blk * block_size;
             // uint8_t* block_ptr = raw_data.data() + block_offset;
             // block_ptr[i * nchans + j] instead of block_data[i * nchans + j]
-
 
             // Extract block
             auto step3_start = std::chrono::high_resolution_clock::now();
