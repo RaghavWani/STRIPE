@@ -13,59 +13,50 @@
 // Last edited 14th Feb 2026; Raghav Wani
 
 // Raw binary data file reader
-std::vector<std::vector<uint8_t>> read_binary_data(const std::string& filename, const size_t num_freq) {
+std::vector<uint8_t> read_binary_data(const std::string& filename, const size_t num_freq) {  
     std::ifstream file(filename, std::ios::binary);
-    if (!file) {
+    if (!file)
         throw std::runtime_error("Cannot open file: " + filename);
-    }
 
-    // Get the file size
     file.seekg(0, std::ios::end);
     std::streampos file_size = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    if (file_size % num_freq != 0) {
-        throw std::runtime_error("File size is not a multiple of " + std::to_string(num_freq) + " bytes: " + filename);
-    }
+    if (file_size % num_freq != 0)
+        throw std::runtime_error("File size not multiple of num_freq");
 
     size_t num_time = static_cast<size_t>(file_size) / num_freq;
 
-    // Initialize a 2D vector to hold the data
-    std::vector<std::vector<uint8_t>> data(num_time, std::vector<uint8_t>(num_freq));
+    std::vector<uint8_t> data(num_time * num_freq);
+    file.read(reinterpret_cast<char*>(data.data()),  data.size() * sizeof(uint8_t));
 
-    // Read the data time-sample by time-sample
-    for (size_t t = 0; t < num_time; ++t) {
-        file.read(reinterpret_cast<char*>(data[t].data()), num_freq * sizeof(uint8_t));
-        if (!file) {
-            throw std::runtime_error("Error reading file: " + filename + " at time sample " + std::to_string(t));
-        }
-    }
-
+    if (!file)
+        throw std::runtime_error("Error reading file");
     file.close();
     return data;
 }
 
 // Datatype conversion function1 
-void uint8_to_float(const std::vector<std::vector<uint8_t>>& in, std::vector<std::vector<float>>& out, size_t nsamples, size_t nchans, float zero_off = 64.0f) {
-    out.resize(nsamples, std::vector<float>(nchans));
+void uint8_to_float(const std::vector<uint8_t>& in, std::vector<float>& out, size_t nsamples, size_t nchans, float zero_off = 64.0f) {
+    out.resize(nsamples*nchans);
 
     for (size_t i = 0; i < nsamples; ++i) {
         for (size_t j = 0; j < nchans; ++j) {
-            out[i][j] = static_cast<float>(in[i][j]) - zero_off;
+            out[i*nchans + j] = static_cast<float>(in[i*nchans + j]) - zero_off;
         }
     }
 }
 
 // Datatype conversion function2
-void float_to_uint8(std::vector<std::vector<float>>& in, std::vector<std::vector<uint8_t>>& out, size_t nsamples, size_t nchans, float outmean, float outstd) {
+void float_to_uint8(std::vector<float>& in, std::vector<uint8_t>& out, size_t nsamples, size_t nchans, float outmean, float outstd) {
     double tmpmean=0., tmpstd=0.;
 
 	for (long int i=0; i<nsamples; ++i)
 	{
 		for (long int j=0; j<nchans; ++j)
 		{
-			tmpmean += in[i][j];
-			tmpstd += in[i][j]*in[i][j];
+			tmpmean += in[i*nchans + j];
+			tmpstd += in[i*nchans + j]*in[i*nchans + j];
 		}
 	}
     auto tmp_1 = nsamples*nchans;
@@ -81,36 +72,33 @@ void float_to_uint8(std::vector<std::vector<float>>& in, std::vector<std::vector
 		{
 			for (long int j=0; j<nchans; ++j)
 			{
-				float tmp = std::round(scl*in[i][j]+offs);
+				float tmp = std::round(scl*in[i*nchans + j]+offs);
 				tmp = std::max(0.f, tmp);
 				tmp = std::min(255.f, tmp);
-				out[i][j] = tmp;
+				out[i*nchans + j] = tmp;
 			}
 		}
 }
 
 // Raw binary data file writer
-void write_binary_data(const std::string& filename, const std::vector<std::vector<uint8_t>>& data, size_t nchans) {
+void write_binary_data(const std::string& filename, const std::vector<uint8_t>& data, size_t nsamples, size_t nchans) {
     std::ofstream file(filename, std::ios::binary);
     if (!file) {
         throw std::runtime_error("Cannot open file for writing: " + filename);
     }
 
     size_t num_time = data.size();
-    if (num_time == 0 || data[0].size() != nchans) {
+    if ( data.size() % nsamples == 0 || data.size() % nchans != 0 ) {
         throw std::runtime_error("Data dimensions do not match expected size (nsamples x 4096): " + filename);
     }
 
-    for (const auto& row : data) {
-        file.write(reinterpret_cast<const char*>(row.data()),
-                   row.size() * sizeof(uint8_t));
-    }
+    file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint8_t));
     file.close();
 }
 
 // SKF based RFI mitigation function
-void skf_filter(std::vector<std::vector<float>>& data, float thresig, size_t nsamples, size_t nchans, bool fill_rand = true) {
-    if (data.empty() || data[0].empty()) {
+void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t nchans, bool fill_rand = true) {
+    if (data.empty()) {
         throw std::runtime_error("Error: Empty data provided. ");
         // return {};
     }
@@ -123,7 +111,7 @@ void skf_filter(std::vector<std::vector<float>>& data, float thresig, size_t nsa
     
     for (int i = 1; i < nsamples; ++i) {
         for (int j = 0; j < nchans; ++j) {
-            double tmp1 = data[i][j];
+            double tmp1 = data[i*nchans + j];
             double tmp2 = tmp1 * tmp1;
             double tmp3 = tmp2 * tmp1;
             double tmp4 = tmp2 * tmp2;
@@ -287,7 +275,7 @@ void skf_filter(std::vector<std::vector<float>>& data, float thresig, size_t nsa
     for (long int i = 0; i < nsamples; ++i)
     {
         for (long int j=0; j < nchans; ++j) {
-                data[i][j] = weights[j]*(data[i][j] - chmean[j]) / chstd[j];
+                data[i*nchans + j] = weights[j]*(data[i*nchans + j] - chmean[j]) / chstd[j];
         }
     }
     auto step5_end = std::chrono::high_resolution_clock::now();
@@ -306,7 +294,7 @@ void skf_filter(std::vector<std::vector<float>>& data, float thresig, size_t nsa
 			for (long int j=0; j<nchans; ++j)
 			{
 				if (weights[j] == 0.)
-					data[i][j] = distribution(generator);
+					data[i*nchans + j] = distribution(generator);
 			}
 		}
     auto step6_end = std::chrono::high_resolution_clock::now();
@@ -315,7 +303,7 @@ void skf_filter(std::vector<std::vector<float>>& data, float thresig, size_t nsa
 } 
 
 // Patch filter
-void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t nchans, std::string filltype){
+void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std::string filltype){
     // Performs running median filter with time scale of width
     // Needs width
 
@@ -325,22 +313,17 @@ void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t
     auto step1_start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < nsamples; ++i)
     {
-        double mean = 0.0;
-        for (int j = 0; j < nchans; ++j)
-            mean += data[i][j];
-        mean /= nchans;
+        double sum = 0;
+        double sq_sum = 0;
+        for (int j = 0; j < nchans; ++j){
+            sum += data[i*nchans + j];
+            sq_sum += data[i*nchans + j] * data[i*nchans + j];}
+        double mean = sum / nchans;
+        double var = sq_sum / nchans - mean * mean;
 
-        double var = 0.0;
-        for (int j = 0; j < nchans; ++j)
-        {
-            double d = data[i][j] - mean;
-            var += d * d;
-        }
-        var /= nchans;
-
-        if (var == 0.0)
+        if (var == 0.0){
             mask[i] = 1; // mask[i] = true;
-
+        }
     }
     auto step1_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
@@ -370,7 +353,6 @@ void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t
     auto step3_start = std::chrono::high_resolution_clock::now();
     std::vector<double> chvar_patch(nchans, 0.);
 	std::vector<double> chmean_patch(nchans, 0.);
-
     long int count = 0;
     for (int i = 0; i < nsamples; ++i)
     {
@@ -380,16 +362,15 @@ void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t
         
         for (int j = 0; j < nchans; ++j)
         {
-            chmean_patch[j] += data[i][j];
-			chvar_patch[j] += data[i][j] * data[i][j];
+            chmean_patch[j] += data[i*nchans + j];
+			chvar_patch[j] += data[i*nchans + j] * data[i*nchans + j];
         }
         ++count;
     }
 
     for (long int j = 0; j < nchans; ++j) {
         chmean_patch[j] /= count;
-        chvar_patch[j] /= count;
-        chvar_patch[j] -= chmean_patch[j] * chmean_patch[j];
+        chvar_patch[j] = chvar_patch[j] / count - chmean_patch[j] * chmean_patch[j];
     }
     auto step3_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
@@ -403,7 +384,7 @@ void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t
         for (long int i=0; i<nsamples; ++i)
 		{
 			if (!mask[i]) continue;
-			for (long int j=0; j<nchans; ++j) {	data[i][j] = chmean_patch[j];}
+			for (long int j=0; j<nchans; ++j) {	data[i*nchans + j] = chmean_patch[j];}
 		}
     }
     else if (filltype == "rand")
@@ -422,7 +403,7 @@ void patch_filter(std::vector<std::vector<float>>& data, size_t nsamples, size_t
         for (long int i=0; i<nsamples; ++i)
 		{
 			if (!mask[i]) continue;
-			for (long int j=0; j<nchans; ++j) { data[i][j] = distributions[j](generators[j]);}
+			for (long int j=0; j<nchans; ++j) { data[i*nchans + j] = distributions[j](generators[j]);}
         }
     }
     auto step4_end = std::chrono::high_resolution_clock::now();
@@ -446,7 +427,7 @@ double std_dev2(double a[], int n) {
 }
 
 // Band Equalization
-void equalization(std::vector<std::vector<float>>& data, size_t nsamples, size_t nchans, std::vector<float>& chmean, std::vector<float>& chstd) { //used double in filtool 
+void equalization(std::vector<float>& data, size_t nsamples, size_t nchans, std::vector<float>& chmean, std::vector<float>& chstd) { //used double in filtool 
     chmean.assign(nchans, 0.0f);
     chstd.assign(nchans, 0.0f);
 
@@ -455,8 +436,8 @@ void equalization(std::vector<std::vector<float>>& data, size_t nsamples, size_t
     for (int i = 0; i < nsamples; ++i)
     {
         for (int j = 0; j < nchans; ++j){
-            chmean[j] += data[i][j];
-            chstd[j] += data[i][j] * data[i][j];        
+            chmean[j] += data[i*nchans + j];
+            chstd[j] += data[i*nchans + j] * data[i*nchans + j];        
         }
     }
     for (int j = 0; j < nchans; ++j)
@@ -477,7 +458,7 @@ void equalization(std::vector<std::vector<float>>& data, size_t nsamples, size_t
     #pragma omp parallel for
     for (int i = 0; i < nsamples; ++i) {
         for (int j = 0; j < nchans; ++j) {
-            data[i][j] = (data[i][j] - chmean[j]) / chstd[j];
+            data[i*nchans + j] = (data[i*nchans + j] - chmean[j]) / chstd[j];
         }
     }
     auto step2_end = std::chrono::high_resolution_clock::now();
@@ -586,7 +567,7 @@ void sliding_median(const T* data, T* out, long size, int w)
 
 }
 
-void baseline_filter(std::vector<std::vector<float>>& buffer, size_t nsamples, size_t nchans, float width, float tsamp)
+void baseline_filter(std::vector<float>& data, size_t nsamples, size_t nchans, float width, float tsamp)
 {
     std::vector<double> s(nsamples, 0.0);
     int window_size = width / tsamp;
@@ -596,7 +577,7 @@ void baseline_filter(std::vector<std::vector<float>>& buffer, size_t nsamples, s
     for (long i = 0; i < nsamples; ++i) {
         double sum = 0.0;
         for (long j = 0; j < nchans; ++j)
-            sum += buffer[i][j];
+            sum += data[i*nchans + j];
         s[i] = sum / nchans;
     }
     auto step1_end = std::chrono::high_resolution_clock::now();
@@ -620,8 +601,8 @@ void baseline_filter(std::vector<std::vector<float>>& buffer, size_t nsamples, s
     for (long i = 0; i < nsamples; ++i) {
         
         for (long j = 0; j < nchans; ++j) {
-            xe[j] += buffer[i][j];
-            xs[j] += buffer[i][j] * s[i];
+            xe[j] += data[i*nchans + j];
+            xs[j] += data[i*nchans + j] * s[i];
         }
         se += s[i];
         ss += s[i]*s[i];
@@ -650,7 +631,7 @@ void baseline_filter(std::vector<std::vector<float>>& buffer, size_t nsamples, s
     auto step5_start = std::chrono::high_resolution_clock::now();
     for (long i = 0; i < nsamples; ++i) {
         for (long j = 0; j < nchans; ++j) {
-            buffer[i][j] -= alpha[j] * s[i] + beta[j];
+            data[i*nchans + j] -= alpha[j] * s[i] + beta[j];
         }
     }
     auto step5_end = std::chrono::high_resolution_clock::now();
@@ -681,7 +662,7 @@ int main(int argc, char* argv[]) {
     float outstd = 3.0;
     float width = 0.0;
     float tsamp = 1.31072e-3f;
-
+    int nchans = 4096;
     auto step1_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
     std::cout << "      MAIN_Step1," << step1_time.count() << ",microseconds" << std::endl;
@@ -695,10 +676,13 @@ int main(int argc, char* argv[]) {
         std::chrono::duration<double, std::milli> step2_time = step2_end - step2_start;
         std::cout << "      MAIN_Step2," << step2_time.count() << ",milliseconds" << std::endl;
 
-        size_t nchans = raw_data[0].size();
+        // size_t nchan = raw_data[0].size();
         size_t nsamples = block_size;
-        size_t n_full = raw_data.size() / block_size;
+        size_t block_len = block_size * nchans;
+        size_t n_full = raw_data.size() / block_len;
         size_t remainder = raw_data.size() % block_size;
+        std::cout << n_full << std::endl;
+        std::cout << block_len << std::endl;
 
         // process data block by block
         for (int blk=0; blk< n_full; ++blk) {
@@ -706,11 +690,16 @@ int main(int argc, char* argv[]) {
             // std::cout << "-----------Processing block, " << blk+1 << " / " << n_full << std::endl;
             auto blk_start = std::chrono::high_resolution_clock::now();
 
+            // size_t block_offset = blk * block_size;
+            // uint8_t* block_ptr = raw_data.data() + block_offset;
+            // block_ptr[i * nchans + j] instead of block_data[i * nchans + j]
+
+
             // Extract block
             auto step3_start = std::chrono::high_resolution_clock::now();
-            std::vector<std::vector<uint8_t>> block_data(
-                raw_data.begin() + blk * block_size,
-                raw_data.begin() + (blk + 1) * block_size
+            std::vector<uint8_t> block_data(
+                raw_data.begin() + blk * block_len,
+                raw_data.begin() + (blk + 1) * block_len
             );
             auto step3_end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
@@ -718,7 +707,7 @@ int main(int argc, char* argv[]) {
 
             // Convert uint8_t data to float
             auto step4_start = std::chrono::high_resolution_clock::now();
-            std::vector<std::vector<float>> float_data;
+            std::vector<float> float_data;
             uint8_to_float(block_data, float_data, nsamples, nchans, 0.0f);
             auto step4_end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
@@ -765,8 +754,13 @@ int main(int argc, char* argv[]) {
             std::copy(
                 block_data.begin(),
                 block_data.end(),
-                raw_data.begin() + blk * block_size
+                raw_data.begin() + blk * block_len
             );
+            // std::copy(
+            //     block_data.data(),
+            //     block_data.data() + block_size,
+            //     raw_data.data() + blk * block_size
+            // );
             auto step10_end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> step10_time = step10_end - step10_start;
             std::cout << "      MAIN_Step10," << step10_time.count() << ",microseconds" << std::endl;
@@ -775,7 +769,6 @@ int main(int argc, char* argv[]) {
             std::chrono::duration<double, std::micro> blk_time = blk_end - blk_start;
             std::cout << "      MAIN_BLK," << blk_time.count() << ",microseconds" << std::endl;
 
-
             float rtf = (block_size * tsamp*1000000) / blk_time.count();
             std::cout << "      RTF,"<< blk << "," << rtf << std::endl;
 
@@ -783,11 +776,11 @@ int main(int argc, char* argv[]) {
 
         // if (remainder > 0) {
         //     // std::cout << "-----------Processing Last block, " << std::endl;
-        //     std::vector<std::vector<uint8_t>> block_data(
+        //     std::vector<uint8_t> block_data(
         //         raw_data.begin() + n_full * block_size,
         //         raw_data.end()
         //     );
-        //     std::vector<std::vector<float>> float_data;
+        //     std::vector<float> float_data;
         //     std::vector<float> chmean, chstd;
         //     uint8_to_float(block_data, float_data, nsamples, nchans, 0.0f);
         //     patch_filter(float_data, nsamples, nchans, filltype);
@@ -804,7 +797,7 @@ int main(int argc, char* argv[]) {
 
         // Write the mitigated data back to a binary file
         auto step11_start = std::chrono::high_resolution_clock::now();
-        write_binary_data(output_filename, raw_data, nchans);
+        write_binary_data(output_filename, raw_data, nsamples, nchans);
         auto step11_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> step11_time = step11_end - step11_start;
         std::cout << "      MAIN_Step11," << step11_time.count() << ",milliseconds" << std::endl;
