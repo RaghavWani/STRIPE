@@ -9,8 +9,11 @@
 #include <string>
 #include <stdexcept>
 #include <iterator>
+#include <filesystem>
 #include <chrono>
-// Last edited 14th Feb 2026; Raghav Wani
+// Last edited 18th Feb 2026; Raghav Wani
+
+namespace fs = std::filesystem;
 
 // Raw binary data file reader
 std::vector<uint8_t> read_binary_data(const std::string& filename, const size_t num_freq) {  
@@ -37,31 +40,24 @@ std::vector<uint8_t> read_binary_data(const std::string& filename, const size_t 
 }
 
 // Datatype conversion function1 
-void uint8_to_float(const std::vector<uint8_t>& in, std::vector<float>& out, size_t nsamples, size_t nchans, float zero_off = 64.0f) {
-    size_t N = nsamples * nchans;
+void uint8_to_float(const std::vector<uint8_t>& in, std::vector<float>& out, size_t N, float zero_off = 64.0f) {
     out.resize(N);
-
-    #pragma omp parallel for simd
     for (size_t k = 0; k < N; ++k) 
         out[k] = static_cast<float>(in[k]) - zero_off;
-        
 }
 
 // Datatype conversion function2
-void float_to_uint8(std::vector<float>& in, std::vector<uint8_t>& out, size_t nsamples, size_t nchans, float outmean, float outstd) {
-    size_t N = nsamples * nchans;
-
+void float_to_uint8(std::vector<float>& in, std::vector<uint8_t>& out, size_t N, float outmean, float outstd) {
     double tmpmean = 0.;
     double tmpstd = 0.;
 
-    #pragma omp parallel for reduction(+:tmpmean,tmpstd)
     for (size_t k = 0; k < N; ++k) {
         double v = in[k];
         tmpmean += v;
         tmpstd  += v*v;
     }
 
-    auto tmp_1 = nsamples * nchans;
+    auto tmp_1 = N;
     tmpmean /= tmp_1;
     tmpstd /= tmp_1;
     tmpstd -= tmpmean * tmpmean;
@@ -70,13 +66,11 @@ void float_to_uint8(std::vector<float>& in, std::vector<uint8_t>& out, size_t ns
     float scl = outstd/tmpstd;
 	float offs = outmean-scl*tmpmean;
 
-    #pragma omp parallel for simd
     for (size_t k = 0; k < N; ++k) {
         float tmp = scl * in[k] + offs;
         tmp = std::round(tmp);
         tmp = std::clamp(tmp, 0.0f, 255.0f);
         out[k] = static_cast<uint8_t>(tmp);
-
     }
 }
 
@@ -100,16 +94,12 @@ void write_binary_data(const std::string& filename, const std::vector<uint8_t>& 
 void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t nchans, bool fill_rand = true) {
     if (data.empty()) {
         throw std::runtime_error("Error: Empty data provided. ");
-        // return {};
     }
     
     // Step 1: Compute per-channel statistics (mean1, mean2, mean3, mean4 for moments, and correlation)
-    auto step1_start = std::chrono::high_resolution_clock::now();    
-
     std::vector<double> chmean1(nchans, 0.), chmean2(nchans, 0.), chmean3(nchans, 0.), 
     chmean4(nchans, 0.), chcorr(nchans, 0.), last_data(nchans, 0.);
     
-    #pragma omp parallel for
     for (int j = 0; j < nchans; ++j) {
         double m1=0,m2=0,m3=0,m4=0,corr=0;
         double last = data[j];
@@ -132,12 +122,8 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
         chmean4[j] = m4;
         chcorr[j]  = corr;
     }
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      SKF_Loop1," << step1_time.count() << ",microseconds" << std::endl;
 
     // Step 2: Compute derived statistics (mean, std, skewness, kurtosis, correlation) per channel
-    auto step2_start = std::chrono::high_resolution_clock::now();
     std::vector<float> chmean(nchans, 0.), chstd(nchans, 0.), chskewness(nchans, 0.), chkurtosis(nchans, 0.);
     
     for (int j = 0; j < nchans; ++j) {
@@ -168,25 +154,9 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
             chcorr[j] = std::numeric_limits<float>::max();
         }
         chstd[j] = std::sqrt(chstd[j]);
-        // std::cout << "RFI Mitigation: Channel " << j << " Mean = " << chmean[j] << ", Std = " << chstd[j]
-        //           << ", Skewness = " << chskewness[j] << ", Kurtosis = " << chkurtosis[j]
-        //           << ", Correlation = " << chcorr[j] << std::endl;
-        // // chcorr_final[j] = chcorr[j]; // CHECK AGAIN
     }
-    auto step2_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step2_time = step2_end - step2_start;
-    std::cout << "      SKF_Loop2," << step2_time.count() << ",microseconds" << std::endl;
     
-    //print chkurtosis, chskewness, chcorr
-    // std::cout << "RFI Mitigation: Kurtosis values: ";
-    // for (const auto& val : chkurtosis) {
-    //     std::cout << val << " ";
-    // }
-    // std::cout << std::endl;
-
     // Step 3: Compute IQR for skewness, kurtosis, and correlation
-    auto step3_start = std::chrono::high_resolution_clock::now();
-
     // kurtosis
     std::vector<float> kurtosis_sort = chkurtosis;
     std::nth_element(kurtosis_sort.begin(), kurtosis_sort.begin()+kurtosis_sort.size()/4, kurtosis_sort.end(), std::less<float>());
@@ -211,37 +181,7 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
 	double corr_q3 = corr_sort[corr_sort.size()/4];
 	double corr_R = corr_q3-corr_q1;
 
-    auto step3_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
-    std::cout << "      SKF_Loop3," << step3_time.count() << ",microseconds" << std::endl;
-    
-    //print IQR values
-    // std::vector<float>::iterator min_it_kurt = std::min_element(std::begin(chkurtosis), std::end(chkurtosis));
-    // std::vector<float>::iterator min_it_skew = std::min_element(std::begin(chskewness), std::end(chskewness));
-    // std::vector<double>::iterator min_it_corr = std::min_element(std::begin(chcorr), std::end(chcorr));
-    // std::vector<float>::iterator max_it_kurt = std::max_element(std::begin(chkurtosis), std::end(chkurtosis));
-    // std::vector<float>::iterator max_it_skew = std::max_element(std::begin(chskewness), std::end(chskewness));
-    // std::vector<double>::iterator max_it_corr = std::max_element(std::begin(chcorr), std::end(chcorr));
-    // std::cout << "      RFI Mitigation: Kurtosis MIN = " << *min_it_kurt << std::endl;
-    // std::cout << "      RFI Mitigation: Kurtosis MAX = " << *max_it_kurt << std::endl;
-    // std::cout << "      RFI Mitigation: Kurtosis Q1 = " << kurtosis_q1 << std::endl;
-    // std::cout << "      RFI Mitigation: Kurtosis Q3 = " << kurtosis_q3 << std::endl;
-    // std::cout << "      RFI Mitigation: Kurtosis IQR = " << kurtosis_R << std::endl;
-
-    // std::cout << "      SKF FILTER: Skewness MIN = " << *min_it_skew << std::endl;
-    // std::cout << "      RFI Mitigation: Skewness MAX = " << *max_it_skew << std::endl;
-    // std::cout << "      RFI Mitigation: Skewness Q1 = " << skewness_q1 << std::endl;
-    // std::cout << "      RFI Mitigation: Skewness Q3 = " << skewness_q3 << std::endl;
-    // std::cout << "      RFI Mitigation: Skewness IQR = " << skewness_R << std::endl;
-
-    // std::cout << "      SKF FILTER: Correlation MIN = " << *min_it_corr << std::endl;
-    // std::cout << "      RFI Mitigation: Correlation MAX = " << *max_it_corr << std::endl;
-    // std::cout << "      RFI Mitigation: Correlation Q1 = " << corr_q1 << std::endl;
-    // std::cout << "      RFI Mitigation: Correlation Q3 = " << corr_q3 << std::endl;
-    // std::cout << "      RFI Mitigation: Correlation IQR = " << corr_R << std::endl;
-
     // Step 4: Flag channels based on IQR thresholds
-    auto step4_start = std::chrono::high_resolution_clock::now();
     std::vector<unsigned char> tmpmask(nchans, 0);
     std::vector<uint8_t> weights(nchans, 0);
     std::fill(weights.begin(), weights.end(), 0.); // Initialize all weights to 0 (flagged)
@@ -265,36 +205,18 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
             weights[j] = 1.;
         }
     }
-
-    // std::cout << "Weights: ";
-    // for (size_t j = 0; j < weights.size(); ++j)
-    //     std::cout << static_cast<int>(weights[j]) << " ";
-    // std::cout << std::endl;
-    // std::cout << "      SKF: Kill count = " << kill_count << std::endl;
     float killrate = kill_count * 1. / nchans;
-    // std::cout << "      SKF: Kill rate = " << killrate * 100 << "%" << std::endl;
-
-    auto step4_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
-    std::cout << "      SKF_Loop4," << step4_time.count() << ",microseconds" << std::endl;
+    std::cout << "SKF: Kill rate = " << killrate * 100 << "%" << std::endl;
 
     // Step5: Normalization
-    auto step5_start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for
     for (int i = 0; i < nsamples; ++i) {
         float* row = &data[i*nchans];
-        #pragma omp simd
         for (int j = 0; j < nchans; ++j) {
             row[j] = weights[j] * (row[j] - chmean[j]) / chstd[j];
         }
     }
-    auto step5_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step5_time = step5_end - step5_start;
-    std::cout << "      SKF_Loop5," << step5_time.count() << ",microseconds" << std::endl;
-
+    
     // Step 6: Bad channel Replacement
-    auto step6_start = std::chrono::high_resolution_clock::now();
-
     std::random_device r;
     std::mt19937 generator(r());
     std::normal_distribution<float> distribution(0., 1.);
@@ -307,24 +229,22 @@ void skf_filter(std::vector<float>& data, float thresig, size_t nsamples, size_t
 					data[i*nchans + j] = distribution(generator);
 			}
 		}
-    auto step6_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step6_time = step6_end - step6_start;
-    std::cout << "      SKF_Loop6," << step6_time.count() << ",microseconds" << std::endl;
 } 
 
 // Patch filter
 void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std::string filltype){
-    // Performs running median filter with time scale of width
-    // Needs width
-
-    std::vector<uint8_t> mask(nsamples, 0); //std::vector<bool> mask(nsamples, false);
+    std::vector<uint8_t> mask(nsamples, 0); 
 
     // Step 1: detect zero-variance rows
     auto step1_start = std::chrono::high_resolution_clock::now();
+    long int kill_count = 0;
+    double killrate = 0.;
+
     for (int i = 0; i < nsamples; ++i)
     {
         double sum = 0;
         double sq_sum = 0;
+        
         for (int j = 0; j < nchans; ++j){
             sum += data[i*nchans + j];
             sq_sum += data[i*nchans + j] * data[i*nchans + j];}
@@ -333,38 +253,19 @@ void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std:
 
         if (var == 0.0){
             mask[i] = 1; // mask[i] = true;
-        }
-    }
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      PATCH_Loop1," << step1_time.count() << ",microseconds" << std::endl;
-
-    
-    // Step 2: kill neighbouring time samples
-    auto step2_start = std::chrono::high_resolution_clock::now();
-    long int kill_count = 0;
-    double killrate = 0.;
-    for (int i = 1; i < nsamples - 1; ++i) //for (long int i=0; i<nsamples; i++)
-    {
-        if (mask[i])
-        {
-            mask[i - 1] = 1;
-            mask[i + 1] = 1;
+            if (i!=0) mask[i-1] = 1;
+            if (i!= nsamples -1) mask[i+1] = 1;
             ++kill_count;
         }
     }
     killrate = kill_count * 1. / nsamples;
-    // std::cout << "      Patch Filter Killrate:" << killrate << std::endl;
-    auto step2_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step2_time = step2_end - step2_start;
-    std::cout << "      PATCH_Loop2," << step2_time.count() << ",microseconds" << std::endl;
-
-    // Step 3: Mean-Variance Calculation of non-flagged time sample
-    auto step3_start = std::chrono::high_resolution_clock::now();
+    std::cout << "Patch Filter: Kill rate = " << killrate << std::endl;
+    
+    // Step 2: Mean-Variance Calculation of non-flagged time sample
     std::vector<double> chvar_patch(nchans, 0.);
 	std::vector<double> chmean_patch(nchans, 0.);
     long int count = 0;
-    for (int i = 0; i < nsamples; ++i)
+    for (int i = 0; i < nsamples; ++i) //swap row for chans
     {
         if (mask[i])
             std::cout << "This time samples is flagged:" << i << std::endl;
@@ -382,15 +283,10 @@ void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std:
         chmean_patch[j] /= count;
         chvar_patch[j] = chvar_patch[j] / count - chmean_patch[j] * chmean_patch[j];
     }
-    auto step3_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
-    std::cout << "      PATCH_Loop3," << step3_time.count() << ",microseconds" << std::endl;
-
-    // Step 4: Fill patched time samples
-    auto step4_start = std::chrono::high_resolution_clock::now();
+    
+    // Step 3: Fill patched time samples
     if (filltype == "mean")
     {
-        // #pragma omp parallel for
         for (long int i=0; i<nsamples; ++i)
 		{
 			if (!mask[i]) continue;
@@ -409,40 +305,20 @@ void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std:
 			distributions.emplace_back(std::normal_distribution<float>(chmean_patch[j], std::sqrt(chvar_patch[j])));
 		}
 
-        // #pragma omp parallel for
         for (long int i=0; i<nsamples; ++i)
 		{
 			if (!mask[i]) continue;
 			for (long int j=0; j<nchans; ++j) { data[i*nchans + j] = distributions[j](generators[j]);}
         }
     }
-    auto step4_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
-    std::cout << "      PATCH_Loop4," << step4_time.count() << ",microseconds" << std::endl;
-
-}
-
-double std_dev2(double a[], int n) {
-    if(n == 0)
-        return 0.0;
-    double sum = 0;
-    double sq_sum = 0;
-    for(int i = 0; i < n; ++i) {
-       sum += a[i];
-       sq_sum += a[i] * a[i];
-    }
-    double mean = sum / n;
-    double variance = sq_sum / n - mean * mean;
-    return sqrt(variance);
 }
 
 // Band Equalization
-void equalization(std::vector<float>& data, size_t nsamples, size_t nchans, std::vector<float>& chmean, std::vector<float>& chstd) { //used double in filtool 
+void equalization(std::vector<float>& data, size_t nsamples, size_t nchans, std::vector<float>& chmean, std::vector<float>& chstd) {  
     chmean.assign(nchans, 0.0f);
     chstd.assign(nchans, 0.0f);
 
     // Step 1: Calculate Mean and Stddev
-    auto step1_start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < nsamples; ++i)
     {
         for (int j = 0; j < nchans; ++j){
@@ -459,22 +335,13 @@ void equalization(std::vector<float>& data, size_t nsamples, size_t nchans, std:
         if (chstd[j] == 0.)
             chstd[j] = 1.;
     }
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      EQUALIZE_Loop1," << step1_time.count() << ",microseconds" << std::endl;
 
     // Step2: Perform Band Equalization
-    auto step2_start = std::chrono::high_resolution_clock::now();
-    #pragma omp parallel for
     for (int i = 0; i < nsamples; ++i) {
         for (int j = 0; j < nchans; ++j) {
             data[i*nchans + j] = (data[i*nchans + j] - chmean[j]) / chstd[j];
         }
     }
-    auto step2_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step2_time = step2_end - step2_start;
-    std::cout << "      EQUALIZE_Loop2," << step2_time.count() << ",microseconds" << std::endl;
-
 }
 
 // Baseline
@@ -482,7 +349,7 @@ template <typename T>
 void sliding_median(const T* data, T* out, long size, int w)
 {
     // low -pass filter; gives smooth gain drift curve
-    w = std::min<long>(w, size); // w = w > size ? size : w;
+    w = std::min<long>(w, size); 
 
     std::multiset<T, std::greater<T>> low;   // max heap
     std::multiset<T, std::less<T>> high;     // min heap
@@ -503,8 +370,6 @@ void sliding_median(const T* data, T* out, long size, int w)
         return (*low.begin() + *high.begin()) / 2;
     };
 
-    auto step1_start = std::chrono::high_resolution_clock::now();
-
     int a = -w/2 - 1;
     int b = (w - 1) / 2;
 
@@ -518,13 +383,8 @@ void sliding_median(const T* data, T* out, long size, int w)
         rebalance();
         median = get_median();
     }
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      BASELINE_MEDIAN_Loop1," << step1_time.count() << ",microseconds" << std::endl;
 
     // Step 2: Median of first half-window
-    auto step2_start = std::chrono::high_resolution_clock::now();
-
     for (int i = 0; i < w/2 + 1 && b < size; ++i) {
         if (data[b] >= median) high.insert(data[b]);
         else low.insert(data[b]);
@@ -533,12 +393,8 @@ void sliding_median(const T* data, T* out, long size, int w)
         out[i] = median;
         ++a; ++b;
     }
-    auto step2_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step2_time = step2_end - step2_start;
-    std::cout << "      BASELINE_MEDIAN_Loop2," << step2_time.count() << ",microseconds" << std::endl;
-
+    
     // Step 3: Median of full sliding window
-    auto step3_start = std::chrono::high_resolution_clock::now();
     for (int i = w/2 + 1; i < size - (w-1)/2; ++i) {
         if (data[b] >= median) high.insert(data[b]);
         else low.insert(data[b]);
@@ -553,13 +409,8 @@ void sliding_median(const T* data, T* out, long size, int w)
 
         ++a; ++b;
     }
-    auto step3_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
-    std::cout << "      BASELINE_MEDIAN_Loop3," << step3_time.count() << ",microseconds" << std::endl;
-
 
     // Step 4: Median of tail window
-    auto step4_start = std::chrono::high_resolution_clock::now();
     for (int i = size - (w-1)/2; i < size; ++i) {
         auto it = low.find(data[a]);
         if (it != low.end()) low.erase(it);
@@ -571,41 +422,26 @@ void sliding_median(const T* data, T* out, long size, int w)
 
         ++a;
     }
-    auto step4_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
-    std::cout << "      BASELINE_MEDIAN_Loop4," << step4_time.count() << ",microseconds" << std::endl;
-
 }
 
-void baseline_filter(std::vector<float>& data, size_t nsamples, size_t nchans, float width, float tsamp)
-{
+void baseline_filter(std::vector<float>& data, size_t nsamples, size_t nchans, float width, float tsamp) {
     std::vector<double> s(nsamples, 0.0);
     int window_size = width / tsamp;
 
     // Step 1: channel mean per time -- timeseries (power vs time) -- captures things common across frequencies
-    auto step1_start = std::chrono::high_resolution_clock::now();
     for (long i = 0; i < nsamples; ++i) {
         double sum = 0.0;
         for (long j = 0; j < nchans; ++j)
             sum += data[i*nchans + j];
         s[i] = sum / nchans;
     }
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      BASELINE_Loop1," << step1_time.count() << ",microseconds" << std::endl;
 
     // Step 2: Median filter s
-    auto step2_start = std::chrono::high_resolution_clock::now();
     std::vector<double> s_med(nsamples);
     sliding_median(s.data(), s_med.data(), nsamples, window_size);
     s = std::move(s_med);
-    auto step2_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step2_time = step2_end - step2_start;
-    std::cout << "      BASELINE_Loop2," << step2_time.count() << ",microseconds" << std::endl;
-
 
     // Step 3: Regression terms estimation
-    auto step3_start = std::chrono::high_resolution_clock::now();
     std::vector<double> xe(nchans, 0.0), xs(nchans, 0.0);
     double se = 0.0, ss = 0.0;
     for (long i = 0; i < nsamples; ++i) {
@@ -617,13 +453,8 @@ void baseline_filter(std::vector<float>& data, size_t nsamples, size_t nchans, f
         se += s[i];
         ss += s[i]*s[i];
     }
-    auto step3_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
-    std::cout << "      BASELINE_Loop3," << step3_time.count() << ",microseconds" << std::endl;
-
 
     // 4) coefficients
-    auto step4_start = std::chrono::high_resolution_clock::now();
     double denom = se*se - ss*nsamples;
     std::vector<double> alpha(nchans, 0.0), beta(nchans, 0.0);
     if (denom != 0.0) {
@@ -632,189 +463,127 @@ void baseline_filter(std::vector<float>& data, size_t nsamples, size_t nchans, f
             beta[j]  = (xs[j]*se - xe[j]*ss) / denom;
         }
     }
-    auto step4_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
-    std::cout << "      BASELINE_Loop4," << step4_time.count() << ",microseconds" << std::endl;
-
 
     // 5) subtract baseline
-    auto step5_start = std::chrono::high_resolution_clock::now();
     for (long i = 0; i < nsamples; ++i) {
         for (long j = 0; j < nchans; ++j) {
             data[i*nchans + j] -= alpha[j] * s[i] + beta[j];
         }
     }
-    auto step5_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step5_time = step5_end - step5_start;
-    std::cout << "      BASELINE_Loop5," << step5_time.count() << ",microseconds" << std::endl;
-
 }
 
 // Main function
 int main(int argc, char* argv[]) {
-    //step 0: RFI MITIGATION
     auto step0_start = std::chrono::high_resolution_clock::now();
 
-    // Step 1: Read input arguments
-    auto step1_start = std::chrono::high_resolution_clock::now();
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " <binary_file_path> <output_file> <block_size> <threshold>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <binary_file_path> <block_size> <threshold>" << std::endl;
         return 1;
     }
-    std::string filename = argv[1];
-    std::string output_filename = argv[2];
-    int block_size = std::stoi(argv[3]);
-    float thresig = std::stof(argv[4]);
+    std::string in_file = argv[1];
+
+    fs::path in_path(in_file);
+    fs::path directory = in_path.parent_path();
+    std::string stem = in_path.stem().string();
+    std::string output_filename = stem + "_stripe.raw";
+    fs::path out_path = directory / output_filename;
+    std::string out_file = out_path.string();
+
+    int block_size = std::stoi(argv[2]);
+    float thresig = std::stof(argv[3]);
     std::string filltype = "rand"; // fixed replacement for masked time samples
     bool fill_rand = true; // fixed random value replacement for SKF flagged channels
-    int fixed_channels = 4096;
+    int nchans = 4096; // fixed number of channels 
     float outmean = 64.0;
     float outstd = 3.0;
     float width = 0.0;
     float tsamp = 1.31072e-3f;
-    int nchans = 4096;
-    auto step1_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::micro> step1_time = step1_end - step1_start;
-    std::cout << "      MAIN_Step1," << step1_time.count() << ",microseconds" << std::endl;
 
     try
     {
         // Read the binary data
-        auto step2_start = std::chrono::high_resolution_clock::now();
-        auto raw_data = read_binary_data(filename, fixed_channels); 
-        auto step2_end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> step2_time = step2_end - step2_start;
-        std::cout << "      MAIN_Step2," << step2_time.count() << ",milliseconds" << std::endl;
+        auto raw_data = read_binary_data(in_file, nchans); 
 
-        // size_t nchan = raw_data[0].size();
         size_t nsamples = block_size;
         size_t block_len = block_size * nchans;
         size_t n_full = raw_data.size() / block_len;
-        size_t remainder = raw_data.size() % block_size;
+        size_t remainder = raw_data.size() % block_len;
+        size_t N = nsamples * nchans;
 
         // process data block by block
         for (int blk=0; blk< n_full; ++blk) {
-            std::cout << "Start,Processing_block," << blk+1 << std::endl;
-            // std::cout << "-----------Processing block, " << blk+1 << " / " << n_full << std::endl;
+            std::cout << "-----------Processing block " << blk+1 << " / " << n_full << std::endl;
             auto blk_start = std::chrono::high_resolution_clock::now();
 
-            // size_t block_offset = blk * block_size;
-            // uint8_t* block_ptr = raw_data.data() + block_offset;
-            // block_ptr[i * nchans + j] instead of block_data[i * nchans + j]
-
             // Extract block
-            auto step3_start = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> block_data(
                 raw_data.begin() + blk * block_len,
                 raw_data.begin() + (blk + 1) * block_len
             );
-            auto step3_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step3_time = step3_end - step3_start;
-            std::cout << "      MAIN_Step3," << step3_time.count() << ",microseconds" << std::endl;
-
-            // Convert uint8_t data to float
-            auto step4_start = std::chrono::high_resolution_clock::now();
             std::vector<float> float_data;
-            uint8_to_float(block_data, float_data, nsamples, nchans, 0.0f);
-            auto step4_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step4_time = step4_end - step4_start;
-            std::cout << "      MAIN_Step4," << step4_time.count() << ",microseconds" << std::endl;
-
-            // Time masking
-            auto step5_start = std::chrono::high_resolution_clock::now();
-            patch_filter(float_data, nsamples, nchans, filltype);            
-            auto step5_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step5_time = step5_end - step5_start;
-            std::cout << "      MAIN_Step5," << step5_time.count() << ",microseconds" << std::endl;
-
-            // SKF RFI mitigation
-            auto step6_start = std::chrono::high_resolution_clock::now();
-            skf_filter(float_data, thresig, nsamples, nchans, fill_rand);
-            auto step6_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step6_time = step6_end - step6_start;
-            std::cout << "      MAIN_Step6," << step6_time.count() << ",microseconds" << std::endl;
-       
-            // Equalization
-            auto step7_start = std::chrono::high_resolution_clock::now();
             std::vector<float> chmean, chstd;
-            equalization(float_data, nsamples, nchans, chmean, chstd);
-            auto step7_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step7_time = step7_end - step7_start;
-            std::cout << "      MAIN_Step7," << step7_time.count() << ",microseconds" << std::endl;
-       
-            // Baseline
-            auto step8_start = std::chrono::high_resolution_clock::now();
-            baseline_filter(float_data, nsamples, nchans, width, tsamp);
-            auto step8_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step8_time = step8_end - step8_start;
-            std::cout << "      MAIN_Step8," << step8_time.count() << ",microseconds" << std::endl;
-       
-            // Convert float data to uint8
-            auto step9_start = std::chrono::high_resolution_clock::now();
-            float_to_uint8(float_data, block_data, nsamples, nchans, outmean, outstd);
-            auto step9_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step9_time = step9_end - step9_start;
-            std::cout << "      MAIN_Step9," << step9_time.count() << ",microseconds" << std::endl;
+            uint8_to_float(block_data, float_data, N, 0.0f); // Convert uint8_t data to float
+            patch_filter(float_data, nsamples, nchans, filltype);  // Time masking          
+            skf_filter(float_data, thresig, nsamples, nchans, fill_rand); // SKF RFI mitigation
+            equalization(float_data, nsamples, nchans, chmean, chstd); // Band Equalization
+            baseline_filter(float_data, nsamples, nchans, width, tsamp); // Baseline Removal
+            float_to_uint8(float_data, block_data, N, outmean, outstd); // Convert float data to uint8
        
             // Copy back the processed block
-            auto step10_start = std::chrono::high_resolution_clock::now();
             std::copy(
                 block_data.begin(),
                 block_data.end(),
                 raw_data.begin() + blk * block_len
             );
-            // std::copy(
-            //     block_data.data(),
-            //     block_data.data() + block_size,
-            //     raw_data.data() + blk * block_size
-            // );
-            auto step10_end = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::micro> step10_time = step10_end - step10_start;
-            std::cout << "      MAIN_Step10," << step10_time.count() << ",microseconds" << std::endl;
-            
+             
             auto blk_end = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::micro> blk_time = blk_end - blk_start;
-            std::cout << "      MAIN_BLK," << blk_time.count() << ",microseconds" << std::endl;
 
             float rtf = (block_size * tsamp*1000000) / blk_time.count();
-            std::cout << "      RTF,"<< blk << "," << rtf << std::endl;
-
+            std::cout << "Real-Time Factor for block " << blk + 1 << ": " << rtf << std::endl;
         }
 
-        // if (remainder > 0) {
-        //     // std::cout << "-----------Processing Last block, " << std::endl;
-        //     std::vector<uint8_t> block_data(
-        //         raw_data.begin() + n_full * block_size,
-        //         raw_data.end()
-        //     );
-        //     std::vector<float> float_data;
-        //     std::vector<float> chmean, chstd;
-        //     uint8_to_float(block_data, float_data, nsamples, nchans, 0.0f);
-        //     patch_filter(float_data, nsamples, nchans, filltype);
-        //     skf_filter(float_data, thresig, nsamples, nchans, fill_rand);
-        //     equalization(float_data, nsamples, nchans, chmean, chstd);
-        //     baseline_filter(float_data, nsamples, nchans, width, tsamp);
-        //     float_to_uint8(float_data, block_data, nsamples, nchans, outmean, outstd);
-        //     std::copy(
-        //         block_data.begin(),
-        //         block_data.end(),
-        //         raw_data.begin() + n_full * block_size
-        //     );
-        // }
+        if (remainder > 0) {
+            auto blk_start = std::chrono::high_resolution_clock::now();
+
+            std::cout << "-----------Processing Last block " << std::endl;
+            std::vector<uint8_t> block_data(
+                raw_data.begin() + n_full * block_size,
+                raw_data.end()
+            );
+            std::vector<float> float_data;
+            std::vector<float> chmean, chstd;
+            uint8_to_float(block_data, float_data, N, 0.0f);
+            patch_filter(float_data, nsamples, nchans, filltype);
+            skf_filter(float_data, thresig, nsamples, nchans, fill_rand);
+            equalization(float_data, nsamples, nchans, chmean, chstd);
+            baseline_filter(float_data, nsamples, nchans, width, tsamp);
+            float_to_uint8(float_data, block_data, N, outmean, outstd);
+            std::copy(
+                block_data.begin(),
+                block_data.end(),
+                raw_data.begin() + n_full * block_size
+            );
+            auto blk_end = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::micro> blk_time = blk_end - blk_start;
+            std::cout << blk_time.count() << "microsec" << std::endl;
+            float rtf_last = (remainder * tsamp * 1000000) / (nchans * blk_time.count());
+            std::cout << "Real-Time Factor for the last block: " << rtf_last << std::endl;
+        }
 
         // Write the mitigated data back to a binary file
-        auto step11_start = std::chrono::high_resolution_clock::now();
-        write_binary_data(output_filename, raw_data, nsamples, nchans);
-        auto step11_end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> step11_time = step11_end - step11_start;
-        std::cout << "      MAIN_Step11," << step11_time.count() << ",milliseconds" << std::endl;
-    
-    } catch (const std::exception& e) {
+        write_binary_data(out_file, raw_data, nsamples, nchans);
+
+        auto step0_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> step0_time = step0_end - step0_start;
+        std::cout << "\nTime taken for RFI Mitigation " << step0_time.count() << " milliseconds" << std::endl;
+        
+        float total_rtf = (raw_data.size() * tsamp*1000) / (4096*step0_time.count()); 
+        std::cout << "Total Real-Time Factor: " << total_rtf << std::endl;
+    } 
+    catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
-    auto step0_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> step0_time = step0_end - step0_start;
-    std::cout << "      MAIN_Step0," << step0_time.count() << ",milliseconds" << std::endl;
     return 0;
 }
