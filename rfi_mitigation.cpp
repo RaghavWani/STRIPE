@@ -267,9 +267,10 @@ void patch_filter(std::vector<float>& data, size_t nsamples, size_t nchans, std:
     long int count = 0;
     for (int i = 0; i < nsamples; ++i) //swap row for chans
     {
-        if (mask[i])
+        if (mask[i]){
             std::cout << "This time samples is flagged:" << i << std::endl;
             continue;
+		}
         
         for (int j = 0; j < nchans; ++j)
         {
