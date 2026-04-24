@@ -1,17 +1,17 @@
 /*
- * rfi_mitigation_omp_fixed.c
- * C conversion of original C++ code by Raghav Wani (Last edited 18th Feb 2026)
+ * stripe.c
+ * STRIPE: SPOTLIGHT Time-domain RFI Processing Engine
+ * RFI Mitigation module with SPOTLIGHT radio transient detection system
+ * Developed by R. Wani (IISER Pune) and S. Kudale (NCRA-TIFR)
+ * Last edited 24th April 2026
  *
  * Compile:
- *   gcc -O2 -std=c11 -fopenmp -o rfi_mitigation_final rfi_mitigation_final.c -lm
+ *   gcc -O2 -std=c11 -fopenmp -o stripe stripe.c -lm
  *
  * Control thread count at runtime:
- *   ./rfi_mitigation_final  <file> <block_size> <threshold> <num_threads>
- *   OMP_NUM_THREADS=8 ./rfi_mitigation_final  <file> <block_size> <threshold>
+ *   ./stripe  <file> <block_size> <threshold> <num_threads>
+ *   OMP_NUM_THREADS=8 ./stripe  <file> <block_size> <threshold>
  *
- * ═══════════════════════════════════════════════════════════════════════
- * BUGS FIXED vs rfi_mitigation_omp.c
- * ═══════════════════════════════════════════════════════════════════════
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -221,7 +221,7 @@ static int cmp_double_asc(const void *a, const void *b)
 static int cmp_double_desc(const void *a, const void *b) { return -cmp_double_asc(a, b); }
 
 /* =========================================================================
- * skf_filter — Statistical Kurtosis Filter
+ * skf_filter — Skewness Kurtosis Filter
  * ====================================================================== */
 void skf_filter(float *data, float thresig, size_t nsamples, size_t nchans)
 {
@@ -531,7 +531,7 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
 }
 
 /* =========================================================================
- * equalization
+ * Band equalization
  * ====================================================================== */
 void equalization(float *data, size_t nsamples, size_t nchans,
                   float *chmean, float *chstd)
@@ -839,7 +839,7 @@ static void sliding_median_double(const double *data, double *out, long size, in
 }
 
 /* =========================================================================
- * baseline_filter
+ * Running median subtraction
  * ====================================================================== */
 void baseline_filter(float *data, size_t nsamples, size_t nchans,
                      float width, float tsamp)
