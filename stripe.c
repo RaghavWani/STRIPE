@@ -6,7 +6,7 @@
  * Compile:
  *   gcc -O2 -std=c11 -fopenmp -o stripe stripe.c -lm
  *
- * Control thread count at runtime:
+ * Execute:
  *   ./stripe  <raw_file_path> <block_size> <threshold> <width> <num_threads>
  *
  * ~ Raghav Wani, Sanjay Kudale (2026)
@@ -37,7 +37,6 @@ static float clampf(float v, float lo, float hi)
 static double now_usec(void) { return omp_get_wtime() * 1e6; }
 static double now_msec(void) { return omp_get_wtime() * 1e3; }
 
-
 /* =========================================================================
  * Error macros
  * ====================================================================== */
@@ -67,7 +66,6 @@ static inline void kahan_add(KahanSum *ks, double v)
     ks->c = (t - ks->sum) - y;
     ks->sum = t;
 }
-
 
 /* =========================================================================
  * Thread-local Box-Muller RNG  (Xorshift64 + Box-Muller)
@@ -100,7 +98,6 @@ static float rng_normal(Rng *r, float mean, float std)
     double z = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979323846 * u2);
     return (float)(mean + std * z);
 }
-
 
 /* =========================================================================
  * I/O
@@ -146,7 +143,6 @@ void write_binary_data(const char *filename, const uint8_t *data, size_t data_si
     if (fclose(f) != 0)
         FATAL("Error closing file");
 }
-
 
 /* =========================================================================
  * Type conversions
@@ -219,7 +215,6 @@ void float_to_uint8(float *in, uint8_t *out, size_t N, float outmean, float outs
     }
 }
 
-
 /* =========================================================================
  * Comparators
  * ====================================================================== */
@@ -241,7 +236,6 @@ static int cmp_double_desc(const void *a, const void *b)
 {
     return -cmp_double_asc(a, b);
 }
-
 
 /* =========================================================================
  * Patch Filter
@@ -362,7 +356,6 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
     free(chvar_patch);
 }
 
-
 /* =========================================================================
  * skf_filter — Skewness Kurtosis Filter
  * ====================================================================== */
@@ -371,7 +364,7 @@ void skf_filter(float *data, float thresig, size_t nsamples, size_t nchans)
     // if (nsamples == 0 || nchans == 0)
     //     FATAL("Empty data in skf_filter");
 
-     /* raw moments per channel */
+    /* raw moments per channel */
     double *chmean1 = (double *)calloc(nchans, sizeof(double));
     double *chmean2 = (double *)calloc(nchans, sizeof(double));
     double *chmean3 = (double *)calloc(nchans, sizeof(double));
@@ -549,7 +542,6 @@ void skf_filter(float *data, float thresig, size_t nsamples, size_t nchans)
     free(weights);
 }
 
-
 /* =========================================================================
  * Band Equalization
  * ====================================================================== */
@@ -642,9 +634,8 @@ void equalization(float *data, size_t nsamples, size_t nchans,
     }
 }
 
-
 /* =========================================================================
- * Heap helpers for sliding_median 
+ * Heap helpers for sliding_median
  * ====================================================================== */
 typedef struct
 {
@@ -859,7 +850,6 @@ static void sliding_median_double(const double *data, double *out, long size, in
     free(fo);
 }
 
-
 /* =========================================================================
  * Baseline Filter
  * ====================================================================== */
@@ -1007,7 +997,6 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
     free(beta);
 }
 
-
 /* =========================================================================
  * Output path helper
  * ====================================================================== */
@@ -1030,7 +1019,6 @@ static void build_output_path(const char *in_file, char *out_file, size_t out_le
     snprintf(out_file, out_len, "%.*s%.*s_stripe.raw",
              (int)dir_len, in_file, (int)stem_len, base);
 }
-
 
 /* =========================================================================
  * process_block
@@ -1058,7 +1046,6 @@ static void process_block(uint8_t *block_ptr, size_t block_N,
     free(cmean);
     free(cstd);
 }
-
 
 /* =========================================================================
  * main
