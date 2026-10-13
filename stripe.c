@@ -1,16 +1,15 @@
-/*
+/* SPOTLIGHT Time-domain RFI Processing Engine (STRIPE)
+ *
  * stripe.c
- * STRIPE: SPOTLIGHT Time-domain RFI Processing Engine
- * RFI Mitigation module with SPOTLIGHT radio transient detection system
- * Developed by R. Wani (IISER Pune) and S. Kudale (NCRA-TIFR)
- * Last edited 24th April 2026
+ * RFI mitigation on beamformed raw data recorded with the SPOTLIGHT backend at uGMRT
  *
  * Compile:
  *   gcc -O2 -std=c11 -fopenmp -o stripe stripe.c -lm
  *
  * Control thread count at runtime:
- *   ./stripe  <file> <block_size> <threshold> <num_threads>
- *   OMP_NUM_THREADS=8 ./stripe  <file> <block_size> <threshold>
+ *   ./stripe  <raw_file_path> <block_size> <threshold> <width> <num_threads>
+ *
+ * ~ Raghav Wani, Sanjay Kudale (2026)
  *
  */
 
@@ -37,6 +36,7 @@ static float clampf(float v, float lo, float hi)
 }
 static double now_usec(void) { return omp_get_wtime() * 1e6; }
 static double now_msec(void) { return omp_get_wtime() * 1e3; }
+
 
 /* =========================================================================
  * Error macros
@@ -67,6 +67,7 @@ static inline void kahan_add(KahanSum *ks, double v)
     ks->c = (t - ks->sum) - y;
     ks->sum = t;
 }
+
 
 /* =========================================================================
  * Thread-local Box-Muller RNG  (Xorshift64 + Box-Muller)
@@ -100,10 +101,11 @@ static float rng_normal(Rng *r, float mean, float std)
     return (float)(mean + std * z);
 }
 
+
 /* =========================================================================
  * I/O
  * ====================================================================== */
-int8_t *read_binary_data(const char *filename, size_t num_freq, size_t *out_size)
+uint8_t *read_binary_data(const char *filename, size_t num_freq, size_t *out_size)
 {
     FILE *f = fopen(filename, "rb");
     if (!f)
@@ -115,7 +117,8 @@ int8_t *read_binary_data(const char *filename, size_t num_freq, size_t *out_size
         FATAL("ftell failed");
     if ((size_t)file_size % num_freq != 0)
         FATAL("File size not multiple of num_freq");
-    int8_t *data = (int8_t *)malloc((size_t)file_size);
+    uint8_t *data = (uint8_t *)malloc((size_t)file_size);
+
     if (!data)
         FATAL("malloc failed in read_binary_data");
     if (fread(data, 1, (size_t)file_size, f) != (size_t)file_size)
@@ -125,36 +128,46 @@ int8_t *read_binary_data(const char *filename, size_t num_freq, size_t *out_size
     return data;
 }
 
-void write_binary_data(const char *filename, const int8_t *data, size_t data_size,
+void write_binary_data(const char *filename, const uint8_t *data, size_t data_size,
                        size_t nsamples, size_t nchans)
 {
+    // if (data_size % nchans != 0 || data_size / nchans != nsamples)
+    //     FATALF("Data dimensions mismatch: %s", filename);
+    if (nchans == 0 || nsamples == 0 ||
+        data_size % nchans != 0) //||
+        FATALF("Data dimensions mismatch: %s", filename);
+
     FILE *f = fopen(filename, "wb");
     if (!f)
         FATALF("Cannot open file for writing: %s", filename);
-    // if (data_size % nsamples != 0 || data_size % nchans != 0) FATALF("Data dimensions mismatch: %s", filename);
-    if (fwrite(data, 1, data_size, f) != data_size)
+
+    if (fwrite(data, sizeof(uint8_t), data_size, f) != data_size)
         FATAL("Error writing file");
-    fclose(f);
+    if (fclose(f) != 0)
+        FATAL("Error closing file");
 }
+
 
 /* =========================================================================
  * Type conversions
  * ====================================================================== */
-void int8_to_float(const int8_t *in, float *out, size_t N, float zero_off)
+void uint8_to_float(const uint8_t *in, float *out, size_t N, float zero_off)
 {
-/* Pure element-wise transform — no accumulation, no ordering issue. */
 #pragma omp parallel for schedule(static)
     for (size_t k = 0; k < N; ++k)
         out[k] = (float)in[k] - zero_off;
 }
 
-void float_to_int8(float *in, int8_t *out, size_t N, float outmean, float outstd)
+void float_to_uint8(float *in, uint8_t *out, size_t N, float outmean, float outstd)
 {
+    if (N == 0)
+        FATAL("float_to_uint8: N=0");
+
     int max_threads = omp_get_max_threads();
     double *t_mean = (double *)calloc((size_t)max_threads, sizeof(double));
     double *t_sq = (double *)calloc((size_t)max_threads, sizeof(double));
     if (!t_mean || !t_sq)
-        FATAL("malloc failed float_to_int8");
+        FATAL("malloc failed float_to_uint8");
 
     int actual_threads = 1;
 
@@ -170,6 +183,7 @@ void float_to_int8(float *in, int8_t *out, size_t N, float outmean, float outstd
             lmean += v;
             lsq += v * v;
         }
+
         t_mean[tid] = lmean;
         t_sq[tid] = lsq;
 
@@ -189,6 +203,7 @@ void float_to_int8(float *in, int8_t *out, size_t N, float outmean, float outstd
 
     double tmpmean = ks_mean.sum / (double)N;
     double tmpstd = ks_sq.sum / (double)N - tmpmean * tmpmean;
+    tmpstd = fmax(tmpstd, 0.0);
     tmpstd = sqrt(tmpstd);
 
     float scl = outstd / (float)tmpstd;
@@ -200,9 +215,10 @@ void float_to_int8(float *in, int8_t *out, size_t N, float outmean, float outstd
         float tmp = scl * in[k] + offs;
         tmp = roundf(tmp);
         tmp = clampf(tmp, 0.0f, 255.0f);
-        out[k] = (int8_t)tmp;
+        out[k] = (uint8_t)tmp;
     }
 }
+
 
 /* =========================================================================
  * Comparators
@@ -212,212 +228,30 @@ static int cmp_float_asc(const void *a, const void *b)
     float fa = *(const float *)a, fb = *(const float *)b;
     return (fa > fb) - (fa < fb);
 }
-static int cmp_float_desc(const void *a, const void *b) { return -cmp_float_asc(a, b); }
+static int cmp_float_desc(const void *a, const void *b)
+{
+    return -cmp_float_asc(a, b);
+}
 static int cmp_double_asc(const void *a, const void *b)
 {
     double fa = *(const double *)a, fb = *(const double *)b;
     return (fa > fb) - (fa < fb);
 }
-static int cmp_double_desc(const void *a, const void *b) { return -cmp_double_asc(a, b); }
-
-/* =========================================================================
- * skf_filter — Skewness Kurtosis Filter
- * ====================================================================== */
-void skf_filter(float *data, float thresig, size_t nsamples, size_t nchans)
+static int cmp_double_desc(const void *a, const void *b)
 {
-    if (nsamples == 0 || nchans == 0)
-        FATAL("Empty data in skf_filter");
-
-    /* ---- Step 1: raw moments per channel (each channel independent) ---- */
-    double *chmean1 = (double *)calloc(nchans, sizeof(double));
-    double *chmean2 = (double *)calloc(nchans, sizeof(double));
-    double *chmean3 = (double *)calloc(nchans, sizeof(double));
-    double *chmean4 = (double *)calloc(nchans, sizeof(double));
-    double *chcorr = (double *)calloc(nchans, sizeof(double));
-    if (!chmean1 || !chmean2 || !chmean3 || !chmean4 || !chcorr)
-        FATAL("malloc failed skf step1");
-
-#pragma omp parallel for schedule(static)
-    for (size_t j = 0; j < nchans; ++j)
-    {
-        double m1 = 0, m2 = 0, m3 = 0, m4 = 0, corr = 0;
-        double last = data[j];
-        for (size_t i = 1; i < nsamples; ++i)
-        {
-            double v = data[i * nchans + j];
-            double v2 = v * v;
-            m1 += v;
-            m2 += v2;
-            m3 += v2 * v;
-            m4 += v2 * v2;
-            corr += v * last;
-            last = v;
-        }
-        chmean1[j] = m1;
-        chmean2[j] = m2;
-        chmean3[j] = m3;
-        chmean4[j] = m4;
-        chcorr[j] = corr;
-    }
-
-    /* ---- Step 2: derived statistics (each channel independent) ---- */
-    float *chmean = (float *)calloc(nchans, sizeof(float));
-    float *chstd = (float *)calloc(nchans, sizeof(float));
-    float *chskewness = (float *)calloc(nchans, sizeof(float));
-    float *chkurtosis = (float *)calloc(nchans, sizeof(float));
-    if (!chmean || !chstd || !chskewness || !chkurtosis)
-        FATAL("malloc failed skf step2");
-
-#pragma omp parallel for schedule(static)
-    for (size_t j = 0; j < nchans; ++j)
-    {
-        chmean1[j] /= nsamples;
-        chmean2[j] /= nsamples;
-        chmean3[j] /= nsamples;
-        chmean4[j] /= nsamples;
-        chcorr[j] /= (nsamples - 1);
-
-        double mu = chmean1[j];
-        double mu2 = mu * mu;
-        double var = chmean2[j] - mu2;
-        chmean[j] = (float)mu;
-
-        if (var > 0.0)
-        {
-            chskewness[j] = (float)(chmean3[j] - 3.0 * chmean2[j] * mu + 2.0 * mu2 * mu);
-            chkurtosis[j] = (float)(chmean4[j] - 4.0 * chmean3[j] * mu + 6.0 * chmean2[j] * mu2 - 3.0 * mu2 * mu2);
-            chkurtosis[j] /= (float)(var * var);
-            chkurtosis[j] -= 3.0f;
-            chskewness[j] /= (float)(var * sqrt(var));
-            chcorr[j] -= mu2;
-            chcorr[j] /= var;
-            chstd[j] = sqrtf((float)var);
-        }
-        else
-        {
-            chstd[j] = 1.0f;
-            chkurtosis[j] = FLT_MAX;
-            chskewness[j] = FLT_MAX;
-            chcorr[j] = FLT_MAX;
-        }
-    }
-
-    /* ---- Step 3: IQR  (serial sort on 4096 elements — negligible) ---- */
-    size_t q_idx = nchans / 4;
-    float kurtosis_q1, kurtosis_q3, kurtosis_R;
-    float skewness_q1, skewness_q3, skewness_R;
-    double corr_q1, corr_q3, corr_R;
-    {
-        float *tmp = (float *)malloc(nchans * sizeof(float));
-        memcpy(tmp, chkurtosis, nchans * sizeof(float));
-        qsort(tmp, nchans, sizeof(float), cmp_float_asc);
-        kurtosis_q1 = tmp[q_idx];
-        qsort(tmp, nchans, sizeof(float), cmp_float_desc);
-        kurtosis_q3 = tmp[q_idx];
-        kurtosis_R = kurtosis_q3 - kurtosis_q1;
-        memcpy(tmp, chskewness, nchans * sizeof(float));
-        qsort(tmp, nchans, sizeof(float), cmp_float_asc);
-        skewness_q1 = tmp[q_idx];
-        qsort(tmp, nchans, sizeof(float), cmp_float_desc);
-        skewness_q3 = tmp[q_idx];
-        skewness_R = skewness_q3 - skewness_q1;
-        free(tmp);
-    }
-    {
-        double *tmp = (double *)malloc(nchans * sizeof(double));
-        for (size_t j = 0; j < nchans; ++j)
-            tmp[j] = chcorr[j];
-        qsort(tmp, nchans, sizeof(double), cmp_double_asc);
-        corr_q1 = tmp[q_idx];
-        qsort(tmp, nchans, sizeof(double), cmp_double_desc);
-        corr_q3 = tmp[q_idx];
-        corr_R = corr_q3 - corr_q1;
-        free(tmp);
-    }
-
-    /* ---- Step 4: flag channels (each channel independent) ---- */
-    int8_t *weights = (int8_t *)calloc(nchans, sizeof(int8_t));
-    if (!weights)
-        FATAL("malloc failed skf step4");
-
-    long kill_count = 0;
-    if (thresig >= 0)
-    {
-#pragma omp parallel for reduction(+ : kill_count) schedule(static)
-        for (size_t j = 0; j < nchans; ++j)
-        {
-            if (chkurtosis[j] >= kurtosis_q1 - thresig * kurtosis_R &&
-                chkurtosis[j] <= kurtosis_q3 + thresig * kurtosis_R &&
-                chskewness[j] >= skewness_q1 - thresig * skewness_R &&
-                chskewness[j] <= skewness_q3 + thresig * skewness_R &&
-                chcorr[j] >= corr_q1 - thresig * corr_R &&
-                chcorr[j] <= corr_q3 + thresig * corr_R)
-            {
-                weights[j] = 1;
-            }
-            else
-            {
-                ++kill_count;
-            }
-        }
-    }
-    else
-    {
-#pragma omp parallel for schedule(static)
-        for (size_t j = 0; j < nchans; ++j)
-            weights[j] = 1;
-    }
-
-#pragma omp critical
-    printf("SKF: Kill rate = %.4f%%\n",
-           (float)kill_count / (float)nchans * 100.0f);
-
-/* ---- Step 5: normalise — each row independent ---- */
-#pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < nsamples; ++i)
-    {
-        float *row = &data[i * nchans];
-        for (size_t j = 0; j < nchans; ++j)
-            row[j] = (float)weights[j] * (row[j] - chmean[j]) / chstd[j];
-    }
-
-/* ---- Step 6: bad-channel fill — thread-local RNG ---- */
-#pragma omp parallel
-    {
-        Rng rng;
-        rng_init(&rng, omp_get_thread_num());
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < nsamples; ++i)
-            for (size_t j = 0; j < nchans; ++j)
-                if (weights[j] == 0)
-                    data[i * nchans + j] = rng_normal(&rng, 0.0f, 1.0f);
-    }
-
-    free(chmean1);
-    free(chmean2);
-    free(chmean3);
-    free(chmean4);
-    free(chcorr);
-    free(chmean);
-    free(chstd);
-    free(chskewness);
-    free(chkurtosis);
-    free(weights);
+    return -cmp_double_asc(a, b);
 }
 
+
 /* =========================================================================
- * patch_filter
- *
- * The atomic neighbour writes are still safe: two threads writing 1 to
- * the same location is idempotent and atomic write prevents torn reads.
+ * Patch Filter
  * ====================================================================== */
 void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
 {
-    int *mask = (int *)calloc(nsamples, sizeof(int));
-    if (!mask)
-        FATAL("malloc failed patch_filter mask");
+    uint8_t *mask = (uint8_t *)calloc(nsamples, sizeof(uint8_t));
+    FATAL("malloc failed patch_filter mask");
 
-/* ---- Step 1: detect zero-variance rows ---- */
+/* detect zero-variance samples */
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < nsamples; ++i)
     {
@@ -430,7 +264,7 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
         }
         double mean = sum / nchans;
         double var = sq_sum / nchans - mean * mean;
-        if (var == 0.0)
+        if (var == 0.0) // CHECK: if (fabs(var) < 1e-12) might be safer?
         {
 #pragma omp atomic write
             mask[i] = 1;
@@ -455,10 +289,7 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
     printf("Patch Filter: Kill rate = %.6f\n",
            (double)kill_count / (double)nsamples);
 
-    /* ---- Step 2: mean/var of non-flagged samples ----
-     * NOTE: Original C++ bug preserved — `continue` always fires here,
-     * so count stays 0 and chmean_patch/chvar_patch stay zero.
-     * See original conversion comment for details. */
+    /* mean/var of non-flagged samples */
     double *chmean_patch = (double *)calloc(nchans, sizeof(double));
     double *chvar_patch = (double *)calloc(nchans, sizeof(double));
     if (!chmean_patch || !chvar_patch)
@@ -468,9 +299,10 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
     for (size_t i = 0; i < nsamples; ++i)
     {
         if (mask[i])
+        {
             printf("This time sample is flagged: %zu\n", i);
-        continue; /* faithfully reproduces original bug */
-
+            continue;
+        }
         for (size_t j = 0; j < nchans; ++j)
         {
             chmean_patch[j] += data[i * nchans + j];
@@ -487,7 +319,7 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
         }
     }
 
-    /* ---- Step 3: fill ---- */
+    /* fill bad samples */
     if (filltype == 0)
     { /* mean fill */
 #pragma omp parallel for schedule(static)
@@ -530,8 +362,196 @@ void patch_filter(float *data, size_t nsamples, size_t nchans, int filltype)
     free(chvar_patch);
 }
 
+
 /* =========================================================================
- * Band equalization
+ * skf_filter — Skewness Kurtosis Filter
+ * ====================================================================== */
+void skf_filter(float *data, float thresig, size_t nsamples, size_t nchans)
+{
+    // if (nsamples == 0 || nchans == 0)
+    //     FATAL("Empty data in skf_filter");
+
+     /* raw moments per channel */
+    double *chmean1 = (double *)calloc(nchans, sizeof(double));
+    double *chmean2 = (double *)calloc(nchans, sizeof(double));
+    double *chmean3 = (double *)calloc(nchans, sizeof(double));
+    double *chmean4 = (double *)calloc(nchans, sizeof(double));
+    double *chcorr = (double *)calloc(nchans, sizeof(double));
+    if (!chmean1 || !chmean2 || !chmean3 || !chmean4 || !chcorr)
+        FATAL("malloc failed skf step1");
+
+#pragma omp parallel for schedule(static)
+    for (size_t j = 0; j < nchans; ++j)
+    {
+        double m1 = 0, m2 = 0, m3 = 0, m4 = 0, corr = 0;
+        double last = data[j];
+        for (size_t i = 0; i < nsamples; ++i)
+        {
+            double v = data[i * nchans + j];
+            double v2 = v * v;
+            m1 += v;
+            m2 += v2;
+            m3 += v2 * v;
+            m4 += v2 * v2;
+            corr += v * last;
+            last = v;
+        }
+        chmean1[j] = m1;
+        chmean2[j] = m2;
+        chmean3[j] = m3;
+        chmean4[j] = m4;
+        chcorr[j] = corr;
+    }
+
+    /* Derived statistics */
+    float *chmean = (float *)calloc(nchans, sizeof(float));
+    float *chstd = (float *)calloc(nchans, sizeof(float));
+    float *chskewness = (float *)calloc(nchans, sizeof(float));
+    float *chkurtosis = (float *)calloc(nchans, sizeof(float));
+    if (!chmean || !chstd || !chskewness || !chkurtosis)
+        FATAL("malloc failed skf step2");
+
+#pragma omp parallel for schedule(static)
+    for (size_t j = 0; j < nchans; ++j)
+    {
+        chmean1[j] /= nsamples;
+        chmean2[j] /= nsamples;
+        chmean3[j] /= nsamples;
+        chmean4[j] /= nsamples;
+        chcorr[j] /= (nsamples - 1);
+
+        double mu = chmean1[j];
+        double mu2 = mu * mu;
+        double var = chmean2[j] - mu2;
+        chmean[j] = (float)mu;
+
+        if (var > 0.0)
+        {
+            chskewness[j] = (float)(chmean3[j] - 3.0 * chmean2[j] * mu + 2.0 * mu2 * mu);
+            chkurtosis[j] = (float)(chmean4[j] - 4.0 * chmean3[j] * mu + 6.0 * chmean2[j] * mu2 - 3.0 * mu2 * mu2);
+            chkurtosis[j] /= (float)(var * var);
+            chkurtosis[j] -= 3.0f; // pearson kurtosis
+            chskewness[j] /= (float)(var * sqrt(var));
+            chcorr[j] -= mu2;
+            chcorr[j] /= var;
+            chstd[j] = sqrtf((float)var);
+        }
+        else
+        {
+            chstd[j] = 1.0f;
+            chkurtosis[j] = FLT_MAX;
+            chskewness[j] = FLT_MAX;
+            chcorr[j] = FLT_MAX;
+        }
+    }
+
+    /* Inter quartile range */
+    size_t q_idx = nchans / 4;
+    float kurtosis_q1, kurtosis_q3, kurtosis_R;
+    float skewness_q1, skewness_q3, skewness_R;
+    double corr_q1, corr_q3, corr_R;
+    {
+        float *tmp = (float *)malloc(nchans * sizeof(float));
+        memcpy(tmp, chkurtosis, nchans * sizeof(float));
+        qsort(tmp, nchans, sizeof(float), cmp_float_asc);
+        kurtosis_q1 = tmp[q_idx];
+        qsort(tmp, nchans, sizeof(float), cmp_float_desc);
+        kurtosis_q3 = tmp[q_idx];
+        kurtosis_R = kurtosis_q3 - kurtosis_q1;
+
+        memcpy(tmp, chskewness, nchans * sizeof(float));
+        qsort(tmp, nchans, sizeof(float), cmp_float_asc);
+        skewness_q1 = tmp[q_idx];
+        qsort(tmp, nchans, sizeof(float), cmp_float_desc);
+        skewness_q3 = tmp[q_idx];
+        skewness_R = skewness_q3 - skewness_q1;
+        free(tmp);
+    }
+    {
+        double *tmp = (double *)malloc(nchans * sizeof(double));
+        for (size_t j = 0; j < nchans; ++j)
+            tmp[j] = chcorr[j];
+        qsort(tmp, nchans, sizeof(double), cmp_double_asc);
+        corr_q1 = tmp[q_idx];
+        qsort(tmp, nchans, sizeof(double), cmp_double_desc);
+        corr_q3 = tmp[q_idx];
+        corr_R = corr_q3 - corr_q1;
+        free(tmp);
+    }
+
+    /* Flag channels */
+    uint8_t *weights = (uint8_t *)calloc(nchans, sizeof(uint8_t));
+    if (!weights)
+        FATAL("malloc failed skf step4");
+    // STORE MASK/ WEIGHTS (next version)
+    long kill_count = 0;
+    if (thresig >= 0)
+    {
+#pragma omp parallel for reduction(+ : kill_count) schedule(static)
+        for (size_t j = 0; j < nchans; ++j)
+        {
+            if (chkurtosis[j] >= kurtosis_q1 - thresig * kurtosis_R &&
+                chkurtosis[j] <= kurtosis_q3 + thresig * kurtosis_R &&
+                chskewness[j] >= skewness_q1 - thresig * skewness_R &&
+                chskewness[j] <= skewness_q3 + thresig * skewness_R &&
+                chcorr[j] >= corr_q1 - thresig * corr_R &&
+                chcorr[j] <= corr_q3 + thresig * corr_R)
+            {
+                weights[j] = 1;
+            }
+            else
+            {
+                ++kill_count;
+            }
+        }
+    }
+    else
+    {
+#pragma omp parallel for schedule(static)
+        for (size_t j = 0; j < nchans; ++j)
+            weights[j] = 1;
+    }
+
+#pragma omp critical
+    printf("SKF: Kill rate = %.4f%%\n",
+           (float)kill_count / (float)nchans * 100.0f);
+
+/* normalisation - each row independent */
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < nsamples; ++i)
+    {
+        float *row = &data[i * nchans];
+        for (size_t j = 0; j < nchans; ++j)
+            row[j] = (float)weights[j] * (row[j] - chmean[j]) / chstd[j];
+    }
+
+/* bad-channel fill — thread-local RNG */
+#pragma omp parallel
+    {
+        Rng rng;
+        rng_init(&rng, omp_get_thread_num());
+#pragma omp for schedule(static)
+        for (size_t i = 0; i < nsamples; ++i)
+            for (size_t j = 0; j < nchans; ++j)
+                if (weights[j] == 0)
+                    data[i * nchans + j] = rng_normal(&rng, 0.0f, 1.0f);
+    }
+
+    free(chmean1);
+    free(chmean2);
+    free(chmean3);
+    free(chmean4);
+    free(chcorr);
+    free(chmean);
+    free(chstd);
+    free(chskewness);
+    free(chkurtosis);
+    free(weights);
+}
+
+
+/* =========================================================================
+ * Band Equalization
  * ====================================================================== */
 void equalization(float *data, size_t nsamples, size_t nchans,
                   float *chmean, float *chstd)
@@ -622,8 +642,9 @@ void equalization(float *data, size_t nsamples, size_t nchans,
     }
 }
 
+
 /* =========================================================================
- * Heap helpers for sliding_median  (unchanged — serial, correct)
+ * Heap helpers for sliding_median 
  * ====================================================================== */
 typedef struct
 {
@@ -838,8 +859,9 @@ static void sliding_median_double(const double *data, double *out, long size, in
     free(fo);
 }
 
+
 /* =========================================================================
- * Running median subtraction
+ * Baseline Filter
  * ====================================================================== */
 void baseline_filter(float *data, size_t nsamples, size_t nchans,
                      float width, float tsamp)
@@ -848,10 +870,10 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
     if (!s)
         FATAL("malloc failed baseline s");
 
-    int window_size = (int)(width / tsamp);
+    int window_size = (int)(width / tsamp); // CHECK: SHould ensure that the window_size is not zero or negative
     int max_threads = omp_get_max_threads();
 
-/* ---- Step 1: channel mean per time sample (each row independent) ---- */
+/* Channel mean per time sample */
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < nsamples; ++i)
     {
@@ -862,7 +884,7 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
         s[i] = sum / nchans;
     }
 
-    /* ---- Step 2: sliding median (inherently serial) ---- */
+    /* Sliding median */
     double *s_med = (double *)malloc(nsamples * sizeof(double));
     if (!s_med)
         FATAL("malloc failed baseline s_med");
@@ -952,7 +974,7 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
     free(cxe);
     free(cxs);
 
-    /* ---- Step 4: coefficients (serial, cheap) ---- */
+    /* Coefficients */
     double denom = se * se - ss * (double)nsamples;
     double *alpha = (double *)calloc(nchans, sizeof(double));
     double *beta = (double *)calloc(nchans, sizeof(double));
@@ -968,7 +990,7 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
         }
     }
 
-/* ---- Step 5: subtract baseline (each row independent) ---- */
+/* Subtract baseline */
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < nsamples; ++i)
     {
@@ -984,6 +1006,7 @@ void baseline_filter(float *data, size_t nsamples, size_t nchans,
     free(alpha);
     free(beta);
 }
+
 
 /* =========================================================================
  * Output path helper
@@ -1008,10 +1031,11 @@ static void build_output_path(const char *in_file, char *out_file, size_t out_le
              (int)dir_len, in_file, (int)stem_len, base);
 }
 
+
 /* =========================================================================
  * process_block
  * ====================================================================== */
-static void process_block(int8_t *block_ptr, size_t block_N,
+static void process_block(uint8_t *block_ptr, size_t block_N,
                           size_t nsamples, size_t nchans, int filltype,
                           float thresig, float outmean, float outstd,
                           float width, float tsamp)
@@ -1022,17 +1046,19 @@ static void process_block(int8_t *block_ptr, size_t block_N,
     if (!fd || !cmean || !cstd)
         FATAL("malloc failed in process_block");
 
-    int8_to_float(block_ptr, fd, block_N, 64.0f);
+    // uint8_to_float(block_ptr, fd, block_N, 64.0f);
+    uint8_to_float(block_ptr, fd, block_N, 0.0f);
     patch_filter(fd, nsamples, nchans, filltype);
     skf_filter(fd, thresig, nsamples, nchans);
     equalization(fd, nsamples, nchans, cmean, cstd);
     baseline_filter(fd, nsamples, nchans, width, tsamp);
-    float_to_int8(fd, block_ptr, block_N, outmean, outstd);
+    float_to_uint8(fd, block_ptr, block_N, outmean, outstd);
 
     free(fd);
     free(cmean);
     free(cstd);
 }
+
 
 /* =========================================================================
  * main
@@ -1041,19 +1067,20 @@ int main(int argc, char *argv[])
 {
     double t_start = now_msec();
 
-    if (argc < 4)
+    if (argc < 5)
     {
-        fprintf(stderr, "Usage: %s <binary_file_path> <block_size> <threshold> [num_threads]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <binary_file_path> <block_size> <threshold> <width> [num_threads]\n", argv[0]);
         return 1;
     }
 
     const char *in_file = argv[1];
     int block_size = atoi(argv[2]);
     float thresig = (float)atof(argv[3]);
+    float width = (float)atof(argv[4]);
 
-    if (argc >= 5)
+    if (argc >= 6)
     {
-        int nt = atoi(argv[4]);
+        int nt = atoi(argv[5]);
         if (nt > 0)
             omp_set_num_threads(nt);
     }
@@ -1073,13 +1100,12 @@ int main(int argc, char *argv[])
 
     const int filltype = 1;
     const int nchans = 4096;
-    const float outmean = 64.0f; // vary this
+    const float outmean = 64.0f;
     const float outstd = 3.0f;
-    const float width = 0.5f; // vary this (low and high)
     const float tsamp = 1.31072e-3f;
 
     size_t raw_size = 0;
-    int8_t *raw_data = read_binary_data(in_file, (size_t)nchans, &raw_size); // SHM data pointer to be *raw_data;
+    uint8_t *raw_data = read_binary_data(in_file, (size_t)nchans, &raw_size); // SHM data pointer to be *raw_data;
 
     size_t nsamples = (size_t)block_size;
     size_t block_len = nsamples * (size_t)nchans;
@@ -1095,7 +1121,7 @@ int main(int argc, char *argv[])
 #pragma omp parallel for num_threads(16) schedule(static) shared(raw_data)
     for (size_t blk = 0; blk < n_full; ++blk)
     {
-        int8_t *block_ptr = raw_data + blk * block_len;
+        uint8_t *block_ptr = raw_data + blk * block_len;
         size_t blk_id = blk;
 
         double blk_start = now_usec();
